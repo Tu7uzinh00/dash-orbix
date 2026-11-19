@@ -1,0 +1,7 @@
+# Só o site criptografado (docs/) e este README vão para o GitHub.
+# Planilhas, dados extraídos, o HTML aberto e build/credenciais.json ficam apenas nesta máquina.
+*
+!.gitignore
+!README.md
+!docs/
+!docs/**
