@@ -37,6 +37,12 @@ button:disabled{opacity:.6;cursor:wait}
 #dock{position:fixed;right:14px;bottom:14px;z-index:10;display:none;gap:8px}
 #dock button{width:auto;padding:9px 14px;font-size:12px;border-radius:10px;background:#1e1e1e;border:1px solid #333;box-shadow:0 8px 24px rgba(0,0,0,.35)}
 @media (max-width:900px){#dock{right:10px;bottom:10px;opacity:.9}#dock button{padding:7px 10px;font-size:11px}}
+#dock .st{display:flex;align-items:center;gap:7px;background:#1e1e1e;border:1px solid #333;border-radius:10px;padding:8px 12px;font-size:12px;color:#ddd;box-shadow:0 8px 24px rgba(0,0,0,.35);cursor:help;max-width:46vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dock .st i{width:8px;height:8px;border-radius:50%;background:#2ecc71;flex:0 0 8px;animation:pulse 2s infinite}
+#dock .st.off{border-color:#7a2a2a;color:#ffb3b3}#dock .st.off i{background:#e74c3c;animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(46,204,113,.6)}70%{box-shadow:0 0 0 7px rgba(46,204,113,0)}100%{box-shadow:0 0 0 0 rgba(46,204,113,0)}}
+#toast{position:fixed;left:50%;bottom:64px;transform:translate(-50%,20px);opacity:0;background:#1e1e1e;border:1px solid var(--dtel);color:#fff;font-size:13px;padding:11px 16px;border-radius:12px;z-index:20;transition:.3s;max-width:92vw;pointer-events:none;box-shadow:0 12px 30px rgba(0,0,0,.4)}
+#toast.on{opacity:1;transform:translate(-50%,0)}
 #dock button.fs{background:linear-gradient(135deg,var(--orbix),var(--orbix-2));border:0}
 </style>
 </head>
@@ -52,74 +58,133 @@ button:disabled{opacity:.6;cursor:wait}
     </div>
     <button id="btn" type="submit">Entrar em tela cheia</button>
     <div class="err" id="err"></div>
-    <div class="foot">Os dados deste painel ficam criptografados e só são abertos com as credenciais corretas.</div>
+    <div class="foot">Os dados ficam criptografados. Depois de entrar, este navegador continua conectado até você clicar em “Sair”.</div>
   </form>
 </div>
 <iframe id="app" title="Dashboard ORBIX"></iframe>
-<div id="dock"><button class="fs" id="fsBtn" type="button">⛶ Tela cheia</button><button id="sair" type="button">Sair</button></div>
+<div id="dock"><span id="status" class="st" title=""><i></i><span id="stTxt">Conectado</span></span><button class="fs" id="fsBtn" type="button">⛶ Tela cheia</button><button id="sair" type="button">Sair</button></div>
+<div id="toast"></div>
 
 <script>
-// Os dados cifrados ficam em painel.json e são sempre baixados sem cache:
-// assim uma troca de senha ou atualização vale na hora, mesmo que esta página esteja em cache.
-let PKG = null;
-async function pacote(){ if (!PKG) { const r = await fetch('painel.json?v=' + Date.now(), {cache:'no-store'}); PKG = await r.json(); } return PKG; }
+// Dados cifrados em painel.json, sempre baixados sem cache.
 const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 const toB64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
-const SK = 'orbix-sessao';
+const $ = id => document.getElementById(id);
+const SK = 'orbix-sessao', QK = 'orbix-quedas', CHECAR_MIN = 5;
+let PKG = null, KEY = null, ultimoIv = null, offlineDesde = null;
+const hora = d => d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+const dataHora = d => d.toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 
+async function baixar(){ const r = await fetch('painel.json?v=' + Date.now(), {cache:'no-store'}); if (!r.ok) throw new Error('http ' + r.status); return r.json(); }
 async function chave(usuario, senha){
-  await pacote();
+  PKG = PKG || await baixar();
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(usuario.trim().toLowerCase() + ':' + senha), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({name:'PBKDF2', salt:b64(PKG.salt), iterations:PKG.iter, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, true, ['decrypt']);
 }
-async function abrir(key){
-  await pacote();
-  const html = new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM', iv:b64(PKG.iv)}, key, b64(PKG.data)));
-  const app = document.getElementById('app');
+const decifra = async (key, pkg) => new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM', iv:b64(pkg.iv)}, key, b64(pkg.data)));
+
+function mostrar(html){
+  const app = $('app'); let aba = null;
+  try { aba = app.contentWindow && app.contentWindow.paginaAtual && app.contentWindow.paginaAtual(); } catch(e){}
+  app.onload = () => {
+    try { if (aba && aba !== 'geral') app.contentWindow.go(aba); } catch(e){}
+    // o primeiro toque dentro do painel coloca em tela cheia (os navegadores exigem um clique)
+    try { app.contentWindow.addEventListener('pointerdown', telaCheia, {once:true}); } catch(e){}
+  };
   app.srcdoc = html;
-  app.style.display = 'block';
-  document.getElementById('login').style.display = 'none';
-  document.getElementById('dock').style.display = 'flex';
+  app.style.display = 'block'; $('login').style.display = 'none'; $('dock').style.display = 'flex';
   atualizaDock();
 }
-function telaCheia(){
-  const el = document.documentElement;
-  if (!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen({navigationUI:'hide'}).catch(()=>{});
+async function entrar(key){
+  PKG = PKG || await baixar();
+  const html = await decifra(key, PKG);
+  KEY = key; ultimoIv = PKG.iv;
+  localStorage.setItem(SK, toB64(await crypto.subtle.exportKey('raw', key)));
+  mostrar(html); status('ok'); manterTelaLigada();
 }
-function atualizaDock(){ document.getElementById('fsBtn').style.display = document.fullscreenElement ? 'none' : 'block'; }
-document.addEventListener('fullscreenchange', atualizaDock);
-document.getElementById('fsBtn').onclick = telaCheia;
-document.getElementById('sair').onclick = () => { sessionStorage.removeItem(SK); if (document.fullscreenElement) document.exitFullscreen(); location.reload(); };
 
-const form = document.getElementById('form'), btn = document.getElementById('btn'), err = document.getElementById('err');
-const salva = sessionStorage.getItem(SK);
-if (salva) {   // sessão aberta nesta aba: só falta o clique para a tela cheia
-  document.getElementById('campos').style.display = 'none';
-  document.getElementById('sub').textContent = 'Sessão ativa. Clique para abrir o painel.';
-  btn.textContent = 'Abrir painel em tela cheia';
+// ---------- status de conexão e registro de quedas ----------
+function quedas(){ try { return JSON.parse(localStorage.getItem(QK)) || []; } catch(e){ return []; } }
+function status(tipo){
+  const st = $('status'), q = quedas();
+  st.className = 'st ' + tipo;
+  let txt = tipo === 'off' ? 'Sem conexão desde ' + hora(new Date(offlineDesde)) + ' — exibindo os últimos dados'
+                           : 'Conectado · verificado ' + hora(new Date());
+  if (q.length && tipo !== 'off') txt += ` · ${q.length} queda${q.length>1?'s':''}`;
+  $('stTxt').textContent = txt;
+  st.title = q.length ? `Quedas registradas: ${q.length}\n` + q.slice(-5).map(x=>`• ${dataHora(new Date(x.ini))} → ${x.fim ? hora(new Date(x.fim)) : 'em andamento'}`).join('\n') : 'Nenhuma queda registrada';
 }
+function caiu(){
+  if (offlineDesde) return;
+  offlineDesde = Date.now();
+  const q = quedas(); q.push({ini: offlineDesde, fim: null}); localStorage.setItem(QK, JSON.stringify(q.slice(-50)));
+  status('off');
+}
+function voltou(){
+  if (!offlineDesde) return;
+  const q = quedas(); if (q.length && !q[q.length-1].fim) q[q.length-1].fim = Date.now(); localStorage.setItem(QK, JSON.stringify(q));
+  aviso(`A conexão caiu às ${hora(new Date(offlineDesde))} e voltou às ${hora(new Date())} (${Math.max(1, Math.round((Date.now()-offlineDesde)/60000))} min). O painel continuou exibindo os dados.`);
+  offlineDesde = null; status('ok');
+}
+function aviso(txt){ const t = $('toast'); t.textContent = txt; t.classList.add('on'); clearTimeout(aviso.t); aviso.t = setTimeout(()=>t.classList.remove('on'), 12000); }
+
+// verificação periódica: atualiza os dados sem derrubar a sessão; só pede login se a senha mudar
+async function verificar(){
+  if (!KEY) return;
+  let pkg;
+  try { pkg = await baixar(); } catch(e) { caiu(); return; }
+  voltou();
+  if (pkg.iv === ultimoIv) { status('ok'); return; }
+  try { const html = await decifra(KEY, pkg); PKG = pkg; ultimoIv = pkg.iv; mostrar(html); status('ok'); aviso('Painel atualizado com os dados mais recentes.'); }
+  catch(e) { encerrar('A senha do painel foi alterada. Entre novamente com a nova senha.'); }
+}
+setInterval(verificar, CHECAR_MIN * 60000);
+addEventListener('online', verificar);
+addEventListener('offline', caiu);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { verificar(); manterTelaLigada(); } });
+
+// mantém a tela ligada enquanto o painel estiver aberto (TV / monitor)
+let lock = null;
+async function manterTelaLigada(){ try { if ('wakeLock' in navigator && !lock) { lock = await navigator.wakeLock.request('screen'); lock.addEventListener('release', () => lock = null); } } catch(e){} }
+
+function telaCheia(){ const el = document.documentElement; if (!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen({navigationUI:'hide'}).catch(()=>{}); }
+function atualizaDock(){ $('fsBtn').style.display = document.fullscreenElement ? 'none' : 'block'; }
+document.addEventListener('fullscreenchange', atualizaDock);
+$('fsBtn').onclick = telaCheia;
+function encerrar(msg){
+  localStorage.removeItem(SK); KEY = null; PKG = null;
+  if (document.fullscreenElement) document.exitFullscreen();
+  $('app').style.display = 'none'; $('app').srcdoc = ''; $('dock').style.display = 'none'; $('login').style.display = '';
+  $('campos').style.display = ''; $('btn').style.display = ''; $('err').textContent = msg || '';
+  $('sub').textContent = 'Acesso restrito. Entre com o usuário e a senha do painel.';
+}
+$('sair').onclick = () => { if (confirm('Sair do painel? Será preciso digitar usuário e senha de novo.')) encerrar(''); };
+
+// ---------- login ----------
+const form = $('form'), btn = $('btn'), err = $('err');
 form.onsubmit = async e => {
   e.preventDefault(); err.textContent = ''; btn.disabled = true;
   telaCheia();                                  // precisa acontecer no clique (regra dos navegadores)
-  try {
-    let key;
-    if (salva && document.getElementById('campos').style.display === 'none') {
-      key = await crypto.subtle.importKey('raw', b64(salva), 'AES-GCM', true, ['decrypt']);
-    } else {
-      key = await chave(document.getElementById('u').value, document.getElementById('p').value);
-    }
-    await abrir(key);
-    sessionStorage.setItem(SK, toB64(await crypto.subtle.exportKey('raw', key)));
-  } catch (x) {
+  try { await entrar(await chave($('u').value, $('p').value)); }
+  catch (x) {
     if (document.fullscreenElement) document.exitFullscreen();
-    sessionStorage.removeItem(SK);
-    document.getElementById('campos').style.display = '';
-    btn.textContent = 'Entrar em tela cheia';
-    err.textContent = 'Usuário ou senha incorretos.';
+    err.textContent = navigator.onLine ? 'Usuário ou senha incorretos.' : 'Sem conexão com a internet.';
     form.classList.remove('shake'); void form.offsetWidth; form.classList.add('shake');
   }
   btn.disabled = false;
 };
+
+// sessão salva neste navegador: abre direto, sem pedir senha
+(async () => {
+  const salva = localStorage.getItem(SK);
+  if (!salva) return;
+  $('sub').textContent = 'Reconectando…'; $('campos').style.display = 'none'; btn.style.display = 'none';
+  try { await entrar(await crypto.subtle.importKey('raw', b64(salva), 'AES-GCM', true, ['decrypt'])); }
+  catch (e) {
+    if (!navigator.onLine) { $('sub').textContent = 'Sem conexão. O painel abre sozinho quando a internet voltar.'; addEventListener('online', () => location.reload(), {once:true}); return; }
+    encerrar('A senha do painel foi alterada. Entre novamente.');
+  }
+})();
 </script>
 </body>
 </html>
